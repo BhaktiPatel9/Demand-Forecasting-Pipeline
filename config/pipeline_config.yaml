@@ -1,0 +1,165 @@
+# ============================================================================
+# Demand Forecasting Pipeline — Configuration
+# ============================================================================
+# Central configuration for all pipeline components.
+# Environment-specific overrides via FORECAST_ENV environment variable.
+# ============================================================================
+
+pipeline:
+  name: "demand-forecasting-pipeline"
+  version: "2.1.0"
+  environment: "production"  # development | staging | production
+  log_level: "INFO"
+
+# ─── Data Sources ─────────────────────────────────────────────────────────────
+
+data:
+  source:
+    type: "s3"
+    bucket: "demand-forecast-prod"
+    prefix: "raw/"
+    format: "parquet"
+    partitions: ["year", "month"]
+  
+  athena:
+    database: "demand_forecast_db"
+    workgroup: "forecast-team"
+    output_location: "s3://demand-forecast-prod/athena-results/"
+  
+  local:
+    raw_path: "data/raw_demand.csv"
+    train_path: "data/train_features.csv"
+    test_path: "data/test_features.csv"
+    output_path: "data/ensemble_output.csv"
+
+  parameters:
+    num_products: 210
+    history_days: 1095  # 3 years
+    start_date: "2021-01-01"
+    min_history_days: 90  # Minimum days required per product
+
+# ─── Feature Engineering ──────────────────────────────────────────────────────
+
+features:
+  lag_periods: [7, 14, 30, 60, 90]
+  rolling_windows: [7, 14, 30]
+  rolling_statistics: ["mean", "std", "min", "max"]
+  
+  calendar_features:
+    - "day_of_week"
+    - "day_of_month"
+    - "month"
+    - "quarter"
+    - "week_of_year"
+    - "is_weekend"
+    - "is_month_start"
+    - "is_month_end"
+    - "days_to_holiday"
+    - "is_holiday_week"
+  
+  price_features:
+    - "price_change_pct"
+    - "price_vs_avg_30d"
+    - "is_promo"
+    - "days_since_promo"
+    - "price_demand_corr_30d"
+  
+  trend_features:
+    - "demand_yoy"
+    - "trend_30d"
+  
+  train_test_split:
+    method: "time_based"
+    train_ratio: 0.80
+    gap_days: 0  # No gap between train and test
+
+# ─── ARIMA Model ──────────────────────────────────────────────────────────────
+
+model_arima:
+  order: [2, 1, 2]
+  seasonal_order: [1, 1, 1, 7]
+  enforce_stationarity: false
+  enforce_invertibility: false
+  max_iterations: 200
+  forecast_horizon: 30
+  
+  product_selection:
+    method: "top_volume"
+    n_products: 50  # Fit individual ARIMA on top-50 by volume
+    min_daily_demand: 20
+  
+  fallback:
+    enabled: true
+    method: "simple_ar"
+    trigger: "convergence_failure"
+
+# ─── Random Forest Model ─────────────────────────────────────────────────────
+
+model_random_forest:
+  n_estimators: 500
+  max_depth: 20
+  min_samples_split: 10
+  min_samples_leaf: 5
+  max_features: "sqrt"
+  oob_score: true
+  n_jobs: -1
+  random_state: 42
+  
+  cross_validation:
+    method: "time_series_split"
+    n_splits: 5
+  
+  feature_selection:
+    method: "importance_threshold"
+    threshold: 0.001  # Drop features with importance < 0.1%
+
+# ─── Ensemble Configuration ──────────────────────────────────────────────────
+
+ensemble:
+  method: "weighted_average"
+  
+  weights:
+    arima: 0.40
+    random_forest: 0.60
+  
+  optimization:
+    enabled: true
+    metric: "mape"
+    weight_range: [0.20, 0.80]
+    step_size: 0.05
+    validation_split: 0.60  # Use 60% of test for weight optimization
+  
+  adaptive:
+    enabled: true
+    window_size: 30
+    threshold_multiplier: 2.0
+    min_weight: 0.20
+    max_weight: 0.80
+
+# ─── Output & Dashboard ──────────────────────────────────────────────────────
+
+output:
+  format: "csv"
+  destination: "s3://demand-forecast-prod/forecasts/"
+  
+  dashboard:
+    platform: "looker"
+    refresh_schedule: "daily"
+    alerts:
+      stockout_risk: true
+      demand_spike: true
+      forecast_degradation: true
+  
+  metrics:
+    target_mape: 10.0  # Alert if MAPE exceeds this
+    target_coverage: 200  # Minimum product lines covered
+
+# ─── Performance Targets ──────────────────────────────────────────────────────
+
+targets:
+  forecast_cycle_hours: 4.0
+  legacy_cycle_days: 3.0
+  speed_improvement_target: 0.87  # 87%
+  margin_improvement_target: 0.12  # 12%
+  product_coverage: 200
+  max_ensemble_mape: 10.0
